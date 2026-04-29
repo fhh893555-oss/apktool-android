@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!--
+        Decoding a real Play-Store APK (modern.apk fixture, ~120 MB) blows
+        through ART's default 192 MB per-app heap inside ResId.of and the
+        resource-table parser. largeHeap raises the cap to ~512 MB on most
+        devices, which is enough for the fixtures we ship. Hosts of the
+        production AAR that decode similarly large APKs should set the same
+        flag in their own manifest.
+    -->
+    <application android:largeHeap="true" />
+</manifest>

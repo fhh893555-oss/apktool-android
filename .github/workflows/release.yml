@@ -1,0 +1,155 @@
+name: Release
+
+# Cuts a GitHub Release for any v* tag push, attaching the assembled
+# apktool-android AAR and a SHA256SUMS file. Also runnable on demand
+# via workflow_dispatch — useful for re-publishing a tag without
+# moving it.
+#
+# Sanity gates: refuses to build if the three committed libaapt2.so
+# binaries are missing or empty (would silently produce an unusable
+# AAR). Refresh them via aapt2-build/recipe/ before tagging.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to release (e.g. v1.0). Must already exist on the repo.'
+        required: true
+
+permissions:
+  contents: write   # required by softprops/action-gh-release
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish AAR
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: version
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          if [[ ! "${TAG}" =~ ^v[0-9] ]]; then
+            echo "::error::Tag ${TAG} does not match v<num>...; refusing to release."
+            exit 1
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=${TAG}"         >> "${GITHUB_OUTPUT}"
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "Releasing tag=${TAG} version=${VERSION}"
+
+      - name: Verify aapt2 binaries are committed
+        run: |
+          set -euo pipefail
+          missing=0
+          for abi in arm64-v8a armeabi-v7a x86_64; do
+            f="brut.apktool/apktool-android/src/main/jniLibs/${abi}/libaapt2.so"
+            if [[ ! -f "${f}" || ! -s "${f}" ]]; then
+              echo "::error::missing or empty ${f}"
+              missing=1
+            else
+              size=$(wc -c < "${f}")
+              echo "ok: ${f} (${size} bytes)"
+            fi
+          done
+          if [[ ${missing} -ne 0 ]]; then
+            echo "::error::Refusing to release without all three libaapt2.so binaries. Rebuild via aapt2-build/recipe/ before tagging."
+            exit 1
+          fi
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: 'zulu'
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v6.1.0
+        with:
+          cache-provider: basic
+
+      - name: Assemble release AAR
+        run: ./gradlew :brut.apktool:apktool-android:assembleRelease --stacktrace
+
+      - name: Stage release artifacts
+        id: artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p release-staging
+          AAR=$(find brut.apktool/apktool-android/build/outputs/aar -name '*-release.aar' | head -n1)
+          if [[ -z "${AAR}" ]]; then
+            echo "::error::no AAR produced under build/outputs/aar"
+            exit 1
+          fi
+
+          OUT="release-staging/apktool-android-${{ steps.version.outputs.version }}.aar"
+          cp "${AAR}" "${OUT}"
+          (cd release-staging && sha256sum *.aar > SHA256SUMS)
+
+          echo "::group::Release artifacts"
+          ls -la release-staging/
+          cat release-staging/SHA256SUMS
+          unzip -l "${OUT}" | head -40
+          echo "::endgroup::"
+
+          # Sanity: AAR must contain classes.jar AND all three jniLibs.
+          for entry in classes.jar \
+                       jni/arm64-v8a/libaapt2.so \
+                       jni/armeabi-v7a/libaapt2.so \
+                       jni/x86_64/libaapt2.so; do
+            if ! unzip -l "${OUT}" | grep -qE "[[:space:]]${entry}\$"; then
+              echo "::error::AAR is missing required entry: ${entry}"
+              exit 1
+            fi
+          done
+
+          echo "aar_path=${OUT}" >> "${GITHUB_OUTPUT}"
+          echo "aar_name=$(basename "${OUT}")" >> "${GITHUB_OUTPUT}"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.tag }}
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(steps.version.outputs.tag, '-') }}
+          files: |
+            release-staging/*.aar
+            release-staging/SHA256SUMS
+          body: |
+            **apktool-android ${{ steps.version.outputs.tag }}**
+
+            **Host app integration:** the attached AAR holds **`ApktoolAndroid`** and the **`libaapt2.so`** natives only — `classes.jar` is tiny; **`apktool-lib` and the rest of the classpath are not inside the AAR** when you use `files("…aar")` / `flatDir`. Either publish a Maven artifact with a proper POM, or vendor the **runtime JAR bundle** from `./gradlew :brut.apktool:apktool-android:collectRuntimeJars` (`build/libs-bundle/`) alongside the AAR. See **[USAGE.md — Gradle integration](https://github.com/${{ github.repository }}/blob/${{ steps.version.outputs.tag }}/USAGE.md#gradle-integration)**.
+
+            **What's in the AAR**
+
+            - `classes.jar` — thin Android entrypoint (`ApktoolAndroid`); **not** a fat jar of Apktool.
+            - `jni/arm64-v8a/libaapt2.so`, `jni/armeabi-v7a/libaapt2.so`,
+              `jni/x86_64/libaapt2.so` — fully-static AOSP `aapt2` builds
+              with iBotPeaches's leniency patches plus PR #3130 layered on
+              top. Verify integrity against `SHA256SUMS`.
+
+            **Requirements**
+
+            - `minSdk = 26`.
+            - `packaging { jniLibs { useLegacyPackaging = true } }` in the
+              host module. Without it, `ProcessBuilder.exec()` cannot
+              launch the bundled `libaapt2.so`.
+            - Run decode/build off the main thread; consider
+              `android:largeHeap="true"` for APKs > 50 MB.

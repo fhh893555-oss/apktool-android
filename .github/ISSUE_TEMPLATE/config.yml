@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Ideas & feature requests
+    url: https://github.com/anirudhmalik/apktool-android/discussions
+    about: Start a discussion for enhancements to the Android library or documentation.
+  - name: Upstream Apktool (desktop CLI, apktool-lib behaviour)
+    url: https://github.com/iBotPeaches/Apktool/issues
+    about: Bugs in core decode/build logic shared with desktop Apktool may belong there first—link this issue if you cross-file.

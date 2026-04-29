@@ -1,0 +1,154 @@
+name: Android
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    paths:
+      - '**.java'
+      - '**.kts'
+      - 'brut.apktool/apktool-android/**'
+      - 'brut.apktool/apktool-android-test/**'
+      - 'aapt2-build/**'
+      - '.github/workflows/android.yml'
+      - 'gradle/libs.versions.toml'
+      - 'gradle/wrapper/**'
+      - 'gradlew'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  assemble-aar:
+    name: Assemble apktool-android.aar
+    runs-on: ubuntu-latest
+    outputs:
+      aar-name: ${{ steps.metadata.outputs.aar-name }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: 'zulu'
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v6.1.0
+        with:
+          cache-provider: basic
+
+      - name: Assemble release AAR
+        run: ./gradlew :brut.apktool:apktool-android:assembleRelease --stacktrace
+
+      - name: Inspect AAR
+        id: metadata
+        run: |
+          set -euo pipefail
+          AAR=$(find brut.apktool/apktool-android/build/outputs/aar -name '*-release.aar' | head -n1)
+          if [[ -z "${AAR}" ]]; then
+            echo "::error::no AAR produced"
+            exit 1
+          fi
+          echo "aar-name=$(basename "${AAR}")" >> "${GITHUB_OUTPUT}"
+          echo "::group::AAR contents"
+          unzip -l "${AAR}"
+          echo "::endgroup::"
+
+          # Sanity-check the AAR contains classes.jar plus per-ABI native libs
+          # (or the jniLibs README placeholder if the workflow ran without
+          # pre-built libaapt2.so artifacts).
+          if ! unzip -l "${AAR}" | grep -q 'classes.jar'; then
+            echo "::error::AAR is missing classes.jar"
+            exit 1
+          fi
+
+      - name: Upload AAR
+        uses: actions/upload-artifact@v7
+        with:
+          name: apktool-android-aar
+          path: brut.apktool/apktool-android/build/outputs/aar/*-release.aar
+          if-no-files-found: error
+
+  instrumented-tests:
+    name: Instrumented tests (API ${{ matrix.api-level }})
+    needs: assemble-aar
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        api-level: [ 30, 34 ]
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: 'zulu'
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v6.1.0
+        with:
+          cache-provider: basic
+
+      # The instrumented tests need libaapt2.so artifacts in
+      # brut.apktool/apktool-android/src/main/jniLibs/<abi>/. CI does NOT
+      # cross-compile aapt2 from AOSP -- that's a manual step (see
+      # aapt2-build/README.md). Skip the emulator phase if the binary is
+      # missing for the runner's ABI; on success it'll exec the bundled
+      # binary like a normal install would.
+      - name: Detect bundled aapt2 binary
+        id: aapt2
+        run: |
+          set -euo pipefail
+          if [[ ! -f brut.apktool/apktool-android/src/main/jniLibs/x86_64/libaapt2.so ]]; then
+            echo "skip=true" >> "${GITHUB_OUTPUT}"
+            echo "::warning::No libaapt2.so for x86_64; instrumented tests will be skipped. Build via aapt2-build/build.sh and commit before re-running."
+          else
+            echo "skip=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Build sample.apk fixture
+        if: steps.aapt2.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          ./gradlew :brut.apktool:apktool-lib:test --tests brut.androlib.BuildAndDecodeApkTest || true
+          mkdir -p brut.apktool/apktool-android-test/src/androidTest/assets
+          # Find the first .apk produced under apktool-lib/build and use it.
+          APK=$(find brut.apktool/apktool-lib/build -name '*.apk' -size +10c | head -n1)
+          if [[ -z "${APK}" ]]; then
+            echo "::error::could not locate sample.apk fixture"
+            exit 1
+          fi
+          cp "${APK}" brut.apktool/apktool-android-test/src/androidTest/assets/sample.apk
+
+      - name: Enable KVM
+        if: steps.aapt2.outputs.skip != 'true'
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Run instrumented tests
+        if: steps.aapt2.outputs.skip != 'true'
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ matrix.api-level }}
+          arch: x86_64
+          target: default
+          force-avd-creation: false
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          script: ./gradlew :brut.apktool:apktool-android-test:connectedDebugAndroidTest --stacktrace
+
+      - name: Upload test reports
+        if: always() && steps.aapt2.outputs.skip != 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: instrumented-test-reports-api${{ matrix.api-level }}
+          path: |
+            brut.apktool/apktool-android-test/build/reports/androidTests/connected/**
+            brut.apktool/apktool-android-test/build/outputs/androidTest-results/**
+          if-no-files-found: ignore

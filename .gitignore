@@ -1,0 +1,49 @@
+# Gradle
+.gradle/
+bin/
+local.properties
+
+# Build
+**/build/
+
+# Native aapt2 build scratch (Path A download cache, Path B staged source)
+aapt2-build/work/
+
+# Path B (self-build) recipe — submodules symlink + cmake build output.
+# The symlink points at ~/work/revanced-aapt2/submodules on the
+# developer's machine; never commit it.
+aapt2-build/recipe/submodules
+aapt2-build/recipe/build/
+aapt2-build/recipe/out/
+aapt2-build/recipe/*.log
+
+# Eclipse
+**/nbproject/private/
+*.project
+*.classpath
+*.settings
+*.setting
+
+# Tmp Files
+*.kate-swp
+*~
+*.DS_Store
+
+# JVM crash + heap dumps (392 MB hprof from a Gradle worker OOM is not a
+# repo artifact). Both root-level and per-module locations.
+hs_err_pid*.log
+java_pid*.hprof
+**/hs_err_pid*.log
+**/java_pid*.hprof
+
+# IntelliJ
+*.iml
+.idea/*
+**/out/
+
+# Patches
+*.patch
+# Whitelist: aapt2 build patches (we DO want these tracked).
+!aapt2-build/patches/*.patch
+!aapt2-build/recipe/patches/*.patch
+local
